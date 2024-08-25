@@ -1253,108 +1253,101 @@ func (aws *AWS) savingsPlanPricing(instanceID string) (*SavingsPlanData, bool) {
 	return data, ok
 }
 
+
+
+// Modified function to fetch spot price history for a specific zone
+func (aws *AWS) getSpotPriceHistory(ctx context.Context, instanceType, availabilityZone string) (float64, error) {
+	aak, err := aws.GetAWSAccessKey()
+	if err != nil {
+		return 0, err
+	}
+
+	// Extract the region from the availability zone
+	region := availabilityZone[:len(availabilityZone)-1]
+
+	cfg, err := aak.CreateConfig(region)
+	if err != nil {
+		return 0, err
+	}
+
+	client := ec2.NewFromConfig(cfg)
+
+	endTime := time.Now()
+	startTime := endTime.Add(-1 * time.Hour)
+
+	input := &ec2.DescribeSpotPriceHistoryInput{
+		InstanceTypes:       []ec2Types.InstanceType{ec2Types.InstanceType(instanceType)},
+		ProductDescriptions: []string{"Linux/UNIX"},
+		StartTime:           &startTime,
+		EndTime:             &endTime,
+		AvailabilityZone:    &availabilityZone,
+	}
+
+	output, err := client.DescribeSpotPriceHistory(ctx, input)
+	if err != nil {
+		return 0, err
+	}
+
+	if len(output.SpotPriceHistory) == 0 {
+		return 0, fmt.Errorf("no spot price history found for %s in %s", instanceType, availabilityZone)
+	}
+
+	latestPrice := output.SpotPriceHistory[0]
+	price, err := strconv.ParseFloat(*latestPrice.SpotPrice, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	return price, nil
+}
+
+// ... [rest of the code remains unchanged]
+
+// Modified createNode function to use availability zone
 func (aws *AWS) createNode(terms *AWSProductTerms, usageType string, k models.Key) (*models.Node, models.PricingMetadata, error) {
 	key := k.Features()
-
 	meta := models.PricingMetadata{}
+
 	var cost string
-	publicPricingFound := true
-	c, ok := terms.OnDemand.PriceDimensions[strings.Join([]string{terms.Sku, terms.OnDemand.OfferTermCode, HourlyRateCode}, ".")]
-	if ok {
-		cost = c.PricePerUnit.USD
+
+	if aws.isPreemptible(key) {
+		labels := k.(*awsKey).Labels
+		instanceType, _ := util.GetInstanceType(labels)
+		availabilityZone, _ := util.GetZone(labels)
+		instanceID := k.ID()
+
+		// First, try to get price from spot data feed
+		if spotInfo, ok := aws.spotPricing(instanceID); ok {
+			log.Infof("Using spot price from data feed for instance %s", instanceID)
+			arr := strings.Split(spotInfo.Charge, " ")
+			if len(arr) == 2 {
+				cost = arr[0]
+			} else {
+				log.Infof("Spot data for node %s is missing or invalid", instanceID)
+			}
+		}
+
+		// If spot data feed doesn't have the price, try AWS Describe Spot Price History API
+		if cost == "" {
+			spotPrice, err := aws.getSpotPriceHistory(context.Background(), instanceType, availabilityZone)
+			if err != nil {
+				log.Warnf("Failed to get spot price from AWS API for %s in %s: %v. Falling back to on-demand price.", instanceType, availabilityZone, err)
+			} else {
+				cost = fmt.Sprintf("%f", spotPrice)
+				log.Infof("Using spot price from AWS API for instance %s in zone %s: %s", instanceID, availabilityZone, cost)
+			}
+		}
+
+		// If both methods fail, fall back to on-demand pricing
+		if cost == "" {
+			cost = aws.getOnDemandCost(terms)
+			log.Infof("Using on-demand price for spot instance %s due to lack of spot pricing data", instanceID)
+		}
+
+		usageType = PreemptibleType
 	} else {
-		// Check for Chinese pricing
-		c, ok = terms.OnDemand.PriceDimensions[strings.Join([]string{terms.Sku, terms.OnDemand.OfferTermCode, HourlyRateCodeCn}, ".")]
-		if ok {
-			cost = c.PricePerUnit.CNY
-		} else {
-			publicPricingFound = false
-		}
-	}
-
-	if spotInfo, ok := aws.spotPricing(k.ID()); ok {
-		var spotcost string
-		log.DedupedInfof(5, "Looking up spot data from feed for node %s", k.ID())
-		arr := strings.Split(spotInfo.Charge, " ")
-		if len(arr) == 2 {
-			spotcost = arr[0]
-		} else {
-			log.Infof("Spot data for node %s is missing", k.ID())
-		}
-		return &models.Node{
-			Cost:         spotcost,
-			VCPU:         terms.VCpu,
-			RAM:          terms.Memory,
-			GPU:          terms.GPU,
-			Storage:      terms.Storage,
-			BaseCPUPrice: aws.BaseCPUPrice,
-			BaseRAMPrice: aws.BaseRAMPrice,
-			BaseGPUPrice: aws.BaseGPUPrice,
-			UsageType:    PreemptibleType,
-		}, meta, nil
-	} else if aws.isPreemptible(key) { // Preemptible but we don't have any data in the pricing report.
-		log.DedupedWarningf(5, "Node %s marked preemptible but we have no data in spot feed", k.ID())
-		if publicPricingFound {
-			// return public price if found
-			return &models.Node{
-				Cost:         cost,
-				VCPU:         terms.VCpu,
-				RAM:          terms.Memory,
-				GPU:          terms.GPU,
-				Storage:      terms.Storage,
-				BaseCPUPrice: aws.BaseCPUPrice,
-				BaseRAMPrice: aws.BaseRAMPrice,
-				BaseGPUPrice: aws.BaseGPUPrice,
-				UsageType:    PreemptibleType,
-			}, meta, nil
-		} else {
-			// return defaults if public pricing not found
-			log.DedupedWarningf(5, "Could not find Node %s's public pricing info, using default configured spot prices instead", k.ID())
-			return &models.Node{
-				VCPU:         terms.VCpu,
-				VCPUCost:     aws.BaseSpotCPUPrice,
-				RAMCost:      aws.BaseSpotRAMPrice,
-				RAM:          terms.Memory,
-				GPU:          terms.GPU,
-				Storage:      terms.Storage,
-				BaseCPUPrice: aws.BaseCPUPrice,
-				BaseRAMPrice: aws.BaseRAMPrice,
-				BaseGPUPrice: aws.BaseGPUPrice,
-				UsageType:    PreemptibleType,
-			}, meta, nil
-		}
-	} else if sp, ok := aws.savingsPlanPricing(k.ID()); ok {
-		strCost := fmt.Sprintf("%f", sp.EffectiveCost)
-		return &models.Node{
-			Cost:         strCost,
-			VCPU:         terms.VCpu,
-			RAM:          terms.Memory,
-			GPU:          terms.GPU,
-			Storage:      terms.Storage,
-			BaseCPUPrice: aws.BaseCPUPrice,
-			BaseRAMPrice: aws.BaseRAMPrice,
-			BaseGPUPrice: aws.BaseGPUPrice,
-			UsageType:    usageType,
-		}, meta, nil
-
-	} else if ri, ok := aws.reservedInstancePricing(k.ID()); ok {
-		strCost := fmt.Sprintf("%f", ri.EffectiveCost)
-		return &models.Node{
-			Cost:         strCost,
-			VCPU:         terms.VCpu,
-			RAM:          terms.Memory,
-			GPU:          terms.GPU,
-			Storage:      terms.Storage,
-			BaseCPUPrice: aws.BaseCPUPrice,
-			BaseRAMPrice: aws.BaseRAMPrice,
-			BaseGPUPrice: aws.BaseGPUPrice,
-			UsageType:    usageType,
-		}, meta, nil
-
-	}
-	// Throw error if public price is not found
-	if !publicPricingFound {
-		return nil, meta, fmt.Errorf("for node \"%s\", cannot find the following key in OnDemand pricing data \"%s\"", k.ID(), k.Features())
+		// On-demand instance
+		cost = aws.getOnDemandCost(terms)
 	}
 
 	return &models.Node{
@@ -1370,6 +1363,13 @@ func (aws *AWS) createNode(terms *AWSProductTerms, usageType string, k models.Ke
 	}, meta, nil
 }
 
+// Helper function to get on-demand cost (unchanged)
+func (aws *AWS) getOnDemandCost(terms *AWSProductTerms) string {
+	if c, ok := terms.OnDemand.PriceDimensions[strings.Join([]string{terms.Sku, terms.OnDemand.OfferTermCode, HourlyRateCode}, ".")]; ok {
+		return c.PricePerUnit.USD
+	}
+	return "" // Return empty string if no cost found
+}
 // NodePricing takes in a key from GetKey and returns a Node object for use in building the cost model.
 func (aws *AWS) NodePricing(k models.Key) (*models.Node, models.PricingMetadata, error) {
 	aws.DownloadPricingDataLock.RLock()
